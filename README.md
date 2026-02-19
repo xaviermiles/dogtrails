@@ -1,6 +1,6 @@
 # Stravata Trails (Rust)
 
-A small Rust + Axum web app that recommends dog-friendly running trails. It ships with sample data and a clean API surface so you can swap in a real provider later (DOC, AllTrails, etc.).
+A small Rust + Axum web app that recommends dog-friendly running trails. It pulls live data from the OpenStreetMap Overpass API (a public API) and keeps provider notes for DOC/AllTrails for future integration.
 
 ## Quick start
 
@@ -21,7 +21,7 @@ Example:
 
 ## Data
 
-Sample trails live in `data/trails.json`. Replace or generate this file from an approved API/data source.
+Trails are fetched at runtime via Overpass using dog access tags. Use the region selector or provide a custom bounding box.
 
 ## Integrations (future)
 

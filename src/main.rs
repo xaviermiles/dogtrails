@@ -2,17 +2,18 @@ use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     extract::{Query, State},
+    http::StatusCode,
     routing::get,
     Json, Router,
 };
 use tower_http::services::ServeDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use stravata::{filter_trails, load_trails, ProviderInfo, TrailQuery};
+use stravata::{filter_trails, ProviderInfo, TrailQuery, TrailService};
 
 #[derive(Clone)]
 struct AppState {
-    trails: Arc<Vec<stravata::Trail>>,
+    service: Arc<TrailService>,
 }
 
 #[tokio::main]
@@ -24,9 +25,11 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let trails = load_trails().expect("failed to load trails data");
+    let overpass_url = std::env::var("OVERPASS_URL")
+        .unwrap_or_else(|_| "https://overpass-api.de/api/interpreter".to_string());
+    let service = TrailService::new(overpass_url);
     let state = AppState {
-        trails: Arc::new(trails),
+        service: Arc::new(service),
     };
 
     let app = Router::new()
@@ -53,9 +56,14 @@ async fn main() {
 async fn get_trails(
     State(state): State<AppState>,
     Query(query): Query<TrailQuery>,
-) -> Json<Vec<stravata::Trail>> {
-    let filtered = filter_trails(&state.trails, &query);
-    Json(filtered)
+) -> Result<Json<Vec<stravata::Trail>>, (StatusCode, String)> {
+    let trails = state
+        .service
+        .fetch_trails(&query)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let filtered = filter_trails(&trails, &query);
+    Ok(Json(filtered))
 }
 
 async fn get_providers() -> Json<Vec<ProviderInfo>> {

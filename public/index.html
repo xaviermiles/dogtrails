@@ -11,13 +11,8 @@
       <header>
         <div>
           <p class="eyebrow">Stravata</p>
-          <h1>Trail recommendations for you + your dog</h1>
-          <p class="subhead">
-            Pick how you’re feeling, and we’ll suggest dog-friendly routes with clear
-            dog-access notes.
-          </p>
+          <h1>Trail recommendations for you + dog</h1>
         </div>
-        <div class="pill">Local sample data · Rust + Axum</div>
       </header>
 
       <main>
@@ -25,6 +20,15 @@
           <h2>Plan your run</h2>
           <form id="trail-form">
             <div class="grid">
+              <label>
+                Region
+                <select name="region">
+                  <option value="wellington" selected>Wellington</option>
+                  <option value="auckland">Auckland</option>
+                  <option value="queenstown">Queenstown</option>
+                  <option value="christchurch">Christchurch</option>
+                </select>
+              </label>
               <label>
                 Effort
                 <select name="effort">
@@ -66,6 +70,22 @@
                 Max distance (km)
                 <input type="number" name="max_km" min="1" step="0.5" placeholder="Optional" />
               </label>
+              <label>
+                Min latitude
+                <input type="number" name="min_lat" step="0.0001" placeholder="Optional" />
+              </label>
+              <label>
+                Min longitude
+                <input type="number" name="min_lon" step="0.0001" placeholder="Optional" />
+              </label>
+              <label>
+                Max latitude
+                <input type="number" name="max_lat" step="0.0001" placeholder="Optional" />
+              </label>
+              <label>
+                Max longitude
+                <input type="number" name="max_lon" step="0.0001" placeholder="Optional" />
+              </label>
             </div>
             <button type="submit">Find trails</button>
           </form>
@@ -87,15 +107,6 @@
             <span id="result-count"></span>
           </div>
           <div id="results" class="results"></div>
-        </section>
-
-        <section class="card">
-          <h2>Provider notes</h2>
-          <ul id="providers" class="providers"></ul>
-          <p class="note">
-            We’re using local sample trails today. Add a verified data source once you pick a
-            mapping provider with an approved API.
-          </p>
         </section>
       </main>
     </div>

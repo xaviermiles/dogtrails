@@ -1,4 +1,7 @@
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +67,10 @@ pub struct TrailQuery {
     pub effort: Option<Effort>,
     pub length: Option<Length>,
     pub max_results: Option<usize>,
+    pub min_lat: Option<f64>,
+    pub min_lon: Option<f64>,
+    pub max_lat: Option<f64>,
+    pub max_lon: Option<f64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -89,13 +96,86 @@ impl ProviderInfo {
                 notes: "Consider user-provided links or approved data feeds; avoid scraping without permission.".to_string(),
                 website: "https://www.alltrails.com".to_string(),
             },
+            ProviderInfo {
+                name: "OpenStreetMap Overpass".to_string(),
+                api_status: "Public API".to_string(),
+                notes: "Uses public OSM data with dog access tags when present.".to_string(),
+                website: "https://overpass-api.de".to_string(),
+            },
         ]
     }
 }
 
-pub fn load_trails() -> Result<Vec<Trail>, serde_json::Error> {
-    let data = include_str!("../data/trails.json");
-    serde_json::from_str(data)
+#[derive(Clone, Copy, PartialEq)]
+pub struct Bbox {
+    pub min_lat: f64,
+    pub min_lon: f64,
+    pub max_lat: f64,
+    pub max_lon: f64,
+}
+
+impl Bbox {
+    pub fn from_query(query: &TrailQuery) -> Option<Self> {
+        Some(Self {
+            min_lat: query.min_lat?,
+            min_lon: query.min_lon?,
+            max_lat: query.max_lat?,
+            max_lon: query.max_lon?,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct TrailError(pub String);
+
+impl std::fmt::Display for TrailError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TrailError {}
+
+pub struct TrailService {
+    client: reqwest::Client,
+    overpass_url: String,
+    cache: RwLock<Option<CacheEntry>>,
+}
+
+struct CacheEntry {
+    fetched_at: Instant,
+    bbox: Bbox,
+    trails: Vec<Trail>,
+}
+
+impl TrailService {
+    pub fn new(overpass_url: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            overpass_url,
+            cache: RwLock::new(None),
+        }
+    }
+
+    pub async fn fetch_trails(&self, query: &TrailQuery) -> Result<Vec<Trail>, TrailError> {
+        let bbox = Bbox::from_query(query).unwrap_or(default_bbox());
+        let ttl = Duration::from_secs(600);
+
+        if let Some(cached) = self.cache.read().await.as_ref() {
+            if cached.bbox == bbox && cached.fetched_at.elapsed() < ttl {
+                return Ok(cached.trails.clone());
+            }
+        }
+
+        let trails = fetch_overpass_trails(&self.client, &self.overpass_url, bbox).await?;
+        let mut cache = self.cache.write().await;
+        *cache = Some(CacheEntry {
+            fetched_at: Instant::now(),
+            bbox,
+            trails: trails.clone(),
+        });
+        Ok(trails)
+    }
 }
 
 pub fn filter_trails(trails: &[Trail], query: &TrailQuery) -> Vec<Trail> {
@@ -125,6 +205,176 @@ pub fn filter_trails(trails: &[Trail], query: &TrailQuery) -> Vec<Trail> {
         .take(max_results)
         .map(|(trail, _)| trail)
         .collect()
+}
+
+fn default_bbox() -> Bbox {
+    Bbox {
+        min_lat: -41.35,
+        min_lon: 174.72,
+        max_lat: -41.24,
+        max_lon: 174.82,
+    }
+}
+
+#[derive(Deserialize)]
+struct OverpassResponse {
+    elements: Vec<OverpassElement>,
+}
+
+#[derive(Deserialize)]
+struct OverpassElement {
+    #[serde(rename = "type")]
+    element_type: String,
+    id: u64,
+    tags: Option<std::collections::HashMap<String, String>>,
+    geometry: Option<Vec<OverpassPoint>>,
+}
+
+#[derive(Deserialize)]
+struct OverpassPoint {
+    lat: f64,
+    lon: f64,
+}
+
+async fn fetch_overpass_trails(
+    client: &reqwest::Client,
+    overpass_url: &str,
+    bbox: Bbox,
+) -> Result<Vec<Trail>, TrailError> {
+    let query = format!(
+        "[out:json][timeout:25];(way[highway=path][dog]({min_lat},{min_lon},{max_lat},{max_lon});way[highway=footway][dog]({min_lat},{min_lon},{max_lat},{max_lon});way[route=hiking][dog]({min_lat},{min_lon},{max_lat},{max_lon}););out tags geom;",
+        min_lat = bbox.min_lat,
+        min_lon = bbox.min_lon,
+        max_lat = bbox.max_lat,
+        max_lon = bbox.max_lon
+    );
+
+    let response = client
+        .post(overpass_url)
+        .form(&[("data", query)])
+        .send()
+        .await
+        .map_err(|err| TrailError(format!("overpass request failed: {err}")))?;
+
+    if !response.status().is_success() {
+        return Err(TrailError(format!(
+            "overpass request failed with status {}",
+            response.status()
+        )));
+    }
+
+    let data: OverpassResponse = response
+        .json()
+        .await
+        .map_err(|err| TrailError(format!("overpass response parse failed: {err}")))?;
+
+    Ok(data
+        .elements
+        .into_iter()
+        .filter(|element| element.element_type == "way")
+        .filter_map(|element| map_overpass_element(element))
+        .collect())
+}
+
+fn map_overpass_element(element: OverpassElement) -> Option<Trail> {
+    let tags = element.tags?;
+    let name = tags.get("name")?.to_string();
+    let dog_policy = map_dog_policy(tags.get("dog"));
+    if dog_policy == DogPolicy::NotAllowed {
+        return None;
+    }
+    let dog_notes = tags.get("dog").and_then(|value| match value.as_str() {
+        "leashed" | "on_leash" | "conditional" => Some("Dogs must be leashed or have restrictions.".to_string()),
+        _ => None,
+    });
+
+    let surface = tags
+        .get("surface")
+        .cloned()
+        .unwrap_or_else(|| "Unknown".to_string());
+    let distance_km = element
+        .geometry
+        .as_ref()
+        .map(|points| compute_distance_km(points))
+        .unwrap_or(0.0);
+
+    let difficulty = map_difficulty(tags.get("sac_scale"), distance_km);
+    let location = tags
+        .get("addr:city")
+        .cloned()
+        .unwrap_or_else(|| "Unknown".to_string());
+    let provider = "OpenStreetMap".to_string();
+    let map_url = format!("https://www.openstreetmap.org/way/{}", element.id);
+
+    Some(Trail {
+        id: format!("osm-{}", element.id),
+        name,
+        provider,
+        location,
+        distance_km,
+        elevation_m: tags
+            .get("ele")
+            .and_then(|value| value.parse::<f32>().ok())
+            .map(|value| value as u32)
+            .unwrap_or(0),
+        difficulty,
+        dog_policy,
+        dog_notes,
+        surface,
+        map_url,
+    })
+}
+
+fn map_dog_policy(value: Option<&String>) -> DogPolicy {
+    match value.map(|value| value.as_str()) {
+        Some("yes") => DogPolicy::Allowed,
+        Some("leashed") | Some("on_leash") | Some("conditional") => DogPolicy::Partial,
+        Some("no") => DogPolicy::NotAllowed,
+        _ => DogPolicy::NotAllowed,
+    }
+}
+
+fn map_difficulty(sac_scale: Option<&String>, distance_km: f32) -> Difficulty {
+    if let Some(scale) = sac_scale {
+        return match scale.as_str() {
+            "hiking" => Difficulty::Easy,
+            "mountain_hiking" => Difficulty::Moderate,
+            "demanding_mountain_hiking" | "alpine_hiking" => Difficulty::Hard,
+            _ => Difficulty::Moderate,
+        };
+    }
+
+    if distance_km <= 6.0 {
+        Difficulty::Easy
+    } else if distance_km <= 14.0 {
+        Difficulty::Moderate
+    } else {
+        Difficulty::Hard
+    }
+}
+
+fn compute_distance_km(points: &[OverpassPoint]) -> f32 {
+    if points.len() < 2 {
+        return 0.0;
+    }
+    let mut total = 0.0;
+    for window in points.windows(2) {
+        total += haversine_km(window[0].lat, window[0].lon, window[1].lat, window[1].lon);
+    }
+    total as f32
+}
+
+fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let radius = 6371.0;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let lat1 = lat1.to_radians();
+    let lat2 = lat2.to_radians();
+
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().asin();
+    radius * c
 }
 
 fn dog_policy_allows(trail: &Trail, filter: &DogFilter) -> bool {
