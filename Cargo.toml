@@ -3,6 +3,9 @@ name = "stravata"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["frontend"]
+
 [dependencies]
 axum = { version = "0.7", features = ["json"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

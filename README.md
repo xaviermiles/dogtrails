@@ -1,10 +1,13 @@
 # Stravata Trails (Rust)
 
-A small Rust + Axum web app that recommends dog-friendly running trails. It pulls live data from the OpenStreetMap Overpass API (a public API) and renders the UI server-side (no JavaScript required).
+A small Rust + Axum web app that recommends dog-friendly running trails. It pulls live data from the OpenStreetMap Overpass API (a public API) and renders the UI with Yew (Rust/WASM).
 
 ## Quick start
 
 ```powershell
+cd d:\Repos\hobbying\stravata\frontend
+trunk build --release
+cd ..
 cargo run
 ```
 
@@ -13,6 +16,14 @@ Open `http://127.0.0.1:3000`.
 If Overpass is busy, you can set multiple endpoints:
 
 `OVERPASS_URL=https://overpass-api.de/api/interpreter,https://overpass.kumi.systems/api/interpreter,https://overpass.nchc.org.tw/api/interpreter`
+
+To enable DOC tracks, set your API key:
+
+`DOC_API_KEY=your-key-here`
+
+## Frontend (Yew)
+
+The frontend is built with Yew and bundled by Trunk. Leaflet is still used for maps via CDN.
 
 ## API
 
@@ -25,7 +36,7 @@ Example:
 
 ## Data
 
-Trails are fetched at runtime via Overpass using dog access tags. Use the region selector or provide a custom bounding box.
+Trails are fetched at runtime via Overpass and DOC (when configured). Adjust the map to set the bounding box.
 
 ## Integrations (future)
 
