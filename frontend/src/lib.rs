@@ -110,7 +110,7 @@ struct Trail {
     provider: String,
     location: String,
     distance_km: f32,
-    elevation_m: u32,
+    elevation_m: Option<f32>,
     difficulty: Difficulty,
     dog_policy: String,
     dog_notes: Option<String>,
@@ -407,6 +407,11 @@ fn render_results(loading: bool, error: Option<String>, trails: Vec<Trail>) -> H
             } else {
                 format!("{:.1} km", trail.distance_km)
             };
+            let elevation_label = if let Some(elevation) = trail.elevation_m {
+                format!("{} m", elevation)
+            } else {
+                "Unknown".to_string()
+            };
             html! {
                 <article class="trail">
                     <h3>{trail.name.clone()}</h3>
@@ -414,7 +419,7 @@ fn render_results(loading: bool, error: Option<String>, trails: Vec<Trail>) -> H
                         <dt>{"Distance"}</dt>
                         <dd>{distance_label}</dd>
                         <dt>{"Elevation"}</dt>
-                        <dd>{format!("{} m", trail.elevation_m)}</dd>
+                        <dd>{elevation_label}</dd>
                         <dt>{"Difficulty"}</dt>
                         <dd>{format_label(&format!("{:?}", trail.difficulty).to_lowercase())}</dd>
                         <dt>{"Dogs"}</dt>
@@ -425,6 +430,8 @@ fn render_results(loading: bool, error: Option<String>, trails: Vec<Trail>) -> H
                         <dd>{trail.location.clone()}</dd>
                         <dt>{"Source"}</dt>
                         <dd><a href={trail.map_url.clone()} target="_blank" rel="noreferrer">{trail.provider.clone()}</a></dd>
+                        <dt>{"ID"}</dt>
+                        <dd>{trail.id.clone()}</dd>
                     </dl>
                     {warning}
                 </article>
