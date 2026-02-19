@@ -14,9 +14,16 @@ pub struct MapHandle {
     map: JsValue,
     leaflet: JsValue,
     marker_layer: JsValue,
+    line_layer: JsValue,
+    on_select: Rc<dyn Fn(Option<String>)>,
 }
 
-pub fn init_map(element: HtmlElement, bbox: Bbox, on_move: impl Fn(Bbox) + 'static) -> MapHandle {
+pub fn init_map(
+    element: HtmlElement,
+    bbox: Bbox,
+    on_move: impl Fn(Bbox) + 'static,
+    on_select: Rc<dyn Fn(Option<String>)>,
+) -> MapHandle {
     let global = js_sys::global();
     let leaflet = Reflect::get(&global, &JsValue::from_str("L"))
         .expect("Leaflet not loaded");
@@ -51,6 +58,10 @@ pub fn init_map(element: HtmlElement, bbox: Bbox, on_move: impl Fn(Bbox) + 'stat
         .expect("layerGroup init failed");
     call_method(&marker_layer, "addTo", &[map.clone()]).ok();
 
+    let line_layer = call_method(&leaflet, "layerGroup", &[])
+        .expect("layerGroup init failed");
+    call_method(&line_layer, "addTo", &[map.clone()]).ok();
+
     let map_for_callback = map.clone();
     let pending_timer = Rc::new(Cell::new(0i32));
     let timer_ref = pending_timer.clone();
@@ -81,11 +92,22 @@ pub fn init_map(element: HtmlElement, bbox: Bbox, on_move: impl Fn(Bbox) + 'stat
 
     callback.forget();
 
-    MapHandle { map, leaflet, marker_layer }
+    // Click on map background clears polyline and deselects trail
+    let line_layer_for_click = line_layer.clone();
+    let on_select_for_click = on_select.clone();
+    let map_click = Closure::wrap(Box::new(move || {
+        call_method(&line_layer_for_click, "clearLayers", &[]).ok();
+        on_select_for_click(None);
+    }) as Box<dyn FnMut()>);
+    call_method(&map, "on", &[JsValue::from_str("click"), map_click.as_ref().clone()]).ok();
+    map_click.forget();
+
+    MapHandle { map, leaflet, marker_layer, line_layer, on_select }
 }
 
 pub fn update_markers(handle: &MapHandle, trails: &[Trail]) {
     call_method(&handle.marker_layer, "clearLayers", &[]).ok();
+    call_method(&handle.line_layer, "clearLayers", &[]).ok();
     for trail in trails {
         if trail.lat == 0.0 && trail.lon == 0.0 {
             continue;
@@ -97,6 +119,37 @@ pub fn update_markers(handle: &MapHandle, trails: &[Trail]) {
         let marker = call_method(&handle.leaflet, "marker", &[latlng.into()])
             .expect("marker failed");
         call_method(&marker, "bindPopup", &[JsValue::from_str(&trail.name)]).ok();
+
+        // On click, draw the trail's polyline and select the trail
+        {
+            let leaflet = handle.leaflet.clone();
+            let line_layer = handle.line_layer.clone();
+            let line = trail.line.clone();
+            let trail_id = trail.id.clone();
+            let on_select = handle.on_select.clone();
+            let callback = Closure::wrap(Box::new(move || {
+                call_method(&line_layer, "clearLayers", &[]).ok();
+                if !line.is_empty() {
+                    let latlngs = Array::new();
+                    for pt in &line {
+                        latlngs.push(&Array::of2(
+                            &JsValue::from_f64(pt[0]),
+                            &JsValue::from_f64(pt[1]),
+                        ));
+                    }
+                    let opts = Object::new();
+                    Reflect::set(&opts, &JsValue::from_str("color"), &JsValue::from_str("#e63946")).ok();
+                    Reflect::set(&opts, &JsValue::from_str("weight"), &JsValue::from_f64(3.0)).ok();
+                    if let Ok(polyline) = call_method(&leaflet, "polyline", &[latlngs.into(), opts.into()]) {
+                        call_method(&polyline, "addTo", &[line_layer.clone()]).ok();
+                    }
+                }
+                on_select(Some(trail_id.clone()));
+            }) as Box<dyn FnMut()>);
+            call_method(&marker, "on", &[JsValue::from_str("click"), callback.as_ref().clone()]).ok();
+            callback.forget();
+        }
+
         call_method(&marker, "addTo", &[handle.marker_layer.clone()]).ok();
     }
 }

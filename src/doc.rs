@@ -65,10 +65,14 @@ pub(crate) async fn fetch_doc_tracks_all(
                     Ok(detail) => {
                         let line_bbox = extract_line_bbox(&item)
                             .or_else(|| extract_line_bbox(&detail));
+                        let line = extract_line_coords(&item)
+                            .or_else(|| extract_line_coords(&detail))
+                            .unwrap_or_default();
                         if let Some(mut trail) = map_doc_track_no_bbox(&item, &detail) {
                             if let Some(lb) = line_bbox {
                                 trail.line_bbox = lb;
                             }
+                            trail.line = line;
                             trails.push(trail);
                         }
                     }
@@ -174,6 +178,7 @@ fn map_doc_track_no_bbox(summary: &Value, detail: &Value) -> Option<Trail> {
         map_url,
         lat: trail_lat,
         lon: trail_lon,
+        line: Vec::new(), // populated by caller
         line_bbox: Bbox {
             min_lat: trail_lat,
             min_lon: trail_lon,
@@ -420,4 +425,29 @@ pub(crate) fn filter_doc_by_bbox(trails: &[Trail], view: Bbox) -> Vec<Trail> {
         .filter(|trail| bbox_intersects(view, trail.line_bbox))
         .cloned()
         .collect()
+}
+
+/// Extract line coordinates as `[[lat, lon], ...]` from the DOC `line` field.
+fn extract_line_coords(value: &Value) -> Option<Vec<[f64; 2]>> {
+    let line = value.get("line")?.as_array()?;
+    let mut coords = Vec::new();
+
+    for segment in line {
+        let points = match segment.as_array() {
+            Some(pts) => pts.as_slice(),
+            None => continue,
+        };
+        for point in points {
+            if let Some(pair) = point.as_array() {
+                // [lon, lat] GeoJSON order → [lat, lon] for Leaflet
+                if pair.len() >= 2 {
+                    if let (Some(lon), Some(lat)) = (pair[0].as_f64(), pair[1].as_f64()) {
+                        coords.push([lat, lon]);
+                    }
+                }
+            }
+        }
+    }
+
+    if coords.is_empty() { None } else { Some(coords) }
 }

@@ -5,6 +5,7 @@ mod leaflet;
 
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
+use std::rc::Rc;
 use wasm_bindgen::JsCast;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -118,6 +119,8 @@ struct Trail {
     map_url: String,
     lat: f64,
     lon: f64,
+    #[serde(default)]
+    line: Vec<[f64; 2]>,
 }
 
 impl Default for Bbox {
@@ -144,6 +147,7 @@ fn app() -> Html {
     let map_handle = use_mut_ref(|| None::<leaflet::MapHandle>);
     let slider_min = use_state(|| 0.0f32);
     let slider_max = use_state(|| 70.0f32);
+    let selected_trail = use_state(|| None::<String>);
 
     // Keep a ref in sync with the latest filters so the map callback can read it
     // without suffering from stale-closure captures.
@@ -155,16 +159,23 @@ fn app() -> Html {
         let filters_ref = filters_ref.clone();
         let map_ref = map_ref.clone();
         let map_handle = map_handle.clone();
+        let selected_trail = selected_trail.clone();
         use_effect_with(
             (),
             move |_| {
                 if let Some(element) = map_ref.cast::<web_sys::HtmlElement>() {
                     let bbox = (*filters).bbox;
+                    let on_select: Rc<dyn Fn(Option<String>)> = {
+                        let selected_trail = selected_trail.clone();
+                        Rc::new(move |id| {
+                            selected_trail.set(id);
+                        })
+                    };
                     let handle = leaflet::init_map(element, bbox, move |bounds| {
                         let mut next = filters_ref.borrow().clone();
                         next.bbox = bounds;
                         filters.set(next);
-                    });
+                    }, on_select);
                     *map_handle.borrow_mut() = Some(handle);
                 }
                 || ()
@@ -193,6 +204,23 @@ fn app() -> Html {
             move |trails| {
                 if let Some(ref handle) = *map_handle.borrow() {
                     leaflet::update_markers(handle, trails);
+                }
+                || ()
+            },
+        );
+    }
+
+    {
+        let selected_id = (*selected_trail).clone();
+        use_effect_with(
+            selected_id,
+            move |id| {
+                if let Some(id) = id {
+                    let code = format!(
+                        "document.getElementById('trail-{}')?.scrollIntoView({{behavior:'smooth',block:'center'}})",
+                        id
+                    );
+                    let _ = js_sys::eval(&code);
                 }
                 || ()
             },
@@ -375,7 +403,7 @@ fn app() -> Html {
                             <div id="map" ref={map_ref}></div>
                         </div>
                         <div class="results">
-                            {render_results(loading, error, trails)}
+                            {render_results(loading, error, trails, (*selected_trail).clone())}
                         </div>
                     </div>
                 </section>
@@ -384,7 +412,7 @@ fn app() -> Html {
     }
 }
 
-fn render_results(loading: bool, error: Option<String>, trails: Vec<Trail>) -> Html {
+fn render_results(loading: bool, error: Option<String>, trails: Vec<Trail>, selected_id: Option<String>) -> Html {
     if loading {
         return html! { <div class="note">{"Loading trails…"}</div> };
     }
@@ -397,6 +425,8 @@ fn render_results(loading: bool, error: Option<String>, trails: Vec<Trail>) -> H
 
     html! {
         for trails.iter().map(|trail| {
+            let is_selected = selected_id.as_deref() == Some(&trail.id);
+            let class = if is_selected { "trail selected" } else { "trail" };
             let warning = if trail.dog_policy != "allowed" {
                 html! { <div class="warning">{trail.dog_notes.clone().unwrap_or_else(|| "Dog access has restrictions.".to_string())}</div> }
             } else {
@@ -413,7 +443,7 @@ fn render_results(loading: bool, error: Option<String>, trails: Vec<Trail>) -> H
                 "Unknown".to_string()
             };
             html! {
-                <article class="trail">
+                <article class={class} id={format!("trail-{}", trail.id)}>
                     <h3>{trail.name.clone()}</h3>
                     <dl class="trail-detail">
                         <dt>{"Distance"}</dt>

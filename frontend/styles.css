@@ -281,6 +281,12 @@ label.checkbox {
   border: 1px solid #eef1f8;
   border-radius: 8px;
   padding: 10px 12px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.trail.selected {
+  border-color: #e63946;
+  box-shadow: 0 0 0 2px rgba(230, 57, 70, 0.25);
 }
 
 .trail h3 {

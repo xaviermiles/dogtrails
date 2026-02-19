@@ -50,7 +50,7 @@ async fn fetch_overpass_trails(
     bbox: Bbox,
 ) -> Result<Vec<Trail>, TrailError> {
     let query = format!(
-        "[out:json][timeout:25];(way[highway=path][dog]({min_lat},{min_lon},{max_lat},{max_lon});way[highway=footway][dog]({min_lat},{min_lon},{max_lat},{max_lon});way[route=hiking][dog]({min_lat},{min_lon},{max_lat},{max_lon}););out tags center;",
+        "[out:json][timeout:25];(way[highway=path][dog]({min_lat},{min_lon},{max_lat},{max_lon});way[highway=footway][dog]({min_lat},{min_lon},{max_lat},{max_lon});way[route=hiking][dog]({min_lat},{min_lon},{max_lat},{max_lon}););out tags geom;",
         min_lat = bbox.min_lat,
         min_lon = bbox.min_lon,
         max_lat = bbox.max_lat,
@@ -183,6 +183,28 @@ fn map_overpass_element(element: OverpassElement) -> Option<Trail> {
         })
         .unwrap_or(0.0);
 
+    let line: Vec<[f64; 2]> = element
+        .geometry
+        .as_ref()
+        .map(|pts| pts.iter().map(|p| [p.lat, p.lon]).collect())
+        .unwrap_or_default();
+
+    let line_bbox = if line.is_empty() {
+        Bbox { min_lat: lat, min_lon: lon, max_lat: lat, max_lon: lon }
+    } else {
+        let mut min_lat_b = f64::MAX;
+        let mut max_lat_b = f64::MIN;
+        let mut min_lon_b = f64::MAX;
+        let mut max_lon_b = f64::MIN;
+        for pt in &line {
+            min_lat_b = min_lat_b.min(pt[0]);
+            max_lat_b = max_lat_b.max(pt[0]);
+            min_lon_b = min_lon_b.min(pt[1]);
+            max_lon_b = max_lon_b.max(pt[1]);
+        }
+        Bbox { min_lat: min_lat_b, min_lon: min_lon_b, max_lat: max_lat_b, max_lon: max_lon_b }
+    };
+
     Some(Trail {
         id: format!("osm-{}", element.id),
         name,
@@ -197,12 +219,8 @@ fn map_overpass_element(element: OverpassElement) -> Option<Trail> {
         map_url,
         lat,
         lon,
-        line_bbox: Bbox {
-            min_lat: lat,
-            min_lon: lon,
-            max_lat: lat,
-            max_lon: lon,
-        },
+        line,
+        line_bbox,
     })
 }
 

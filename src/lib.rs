@@ -52,6 +52,9 @@ pub struct Trail {
     pub map_url: String,
     pub lat: f64,
     pub lon: f64,
+    /// Track line as `[[lat, lon], ...]` for map display.
+    #[serde(default)]
+    pub line: Vec<[f64; 2]>,
     #[serde(skip)]
     pub line_bbox: Bbox,
 }
@@ -419,6 +422,7 @@ mod tests {
                 map_url: "https://www.doc.govt.nz".to_string(),
                 lat: -41.3,
                 lon: 174.7,
+                line: Vec::new(),
                 line_bbox: Bbox { min_lat: -41.3, min_lon: 174.7, max_lat: -41.3, max_lon: 174.7 },
             },
             Trail {
@@ -435,6 +439,7 @@ mod tests {
                 map_url: "https://www.openstreetmap.org/".to_string(),
                 lat: -36.8,
                 lon: 174.7,
+                line: Vec::new(),
                 line_bbox: Bbox { min_lat: -36.8, min_lon: 174.7, max_lat: -36.8, max_lon: 174.7 },
             },
         ]
