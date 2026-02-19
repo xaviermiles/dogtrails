@@ -138,7 +138,7 @@ impl std::error::Error for TrailError {}
 
 pub struct TrailService {
     client: reqwest::Client,
-    overpass_url: String,
+    overpass_urls: Vec<String>,
     cache: RwLock<Option<CacheEntry>>,
 }
 
@@ -149,12 +149,16 @@ struct CacheEntry {
 }
 
 impl TrailService {
-    pub fn new(overpass_url: String) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            overpass_url,
+    pub fn new(overpass_urls: Vec<String>) -> Result<Self, TrailError> {
+        let client = reqwest::Client::builder()
+            .user_agent("stravata/0.1 (https://example.local)")
+            .build()
+            .map_err(|err| TrailError(format!("failed to build http client: {err}")))?;
+        Ok(Self {
+            client,
+            overpass_urls,
             cache: RwLock::new(None),
-        }
+        })
     }
 
     pub async fn fetch_trails(&self, query: &TrailQuery) -> Result<Vec<Trail>, TrailError> {
@@ -167,7 +171,7 @@ impl TrailService {
             }
         }
 
-        let trails = fetch_overpass_trails(&self.client, &self.overpass_url, bbox).await?;
+        let trails = fetch_overpass_with_fallback(&self.client, &self.overpass_urls, bbox).await?;
         let mut cache = self.cache.write().await;
         *cache = Some(CacheEntry {
             fetched_at: Instant::now(),
@@ -236,30 +240,58 @@ struct OverpassPoint {
     lon: f64,
 }
 
+async fn fetch_overpass_with_fallback(
+    client: &reqwest::Client,
+    overpass_urls: &[String],
+    bbox: Bbox,
+) -> Result<Vec<Trail>, TrailError> {
+    let mut last_error: Option<TrailError> = None;
+    for url in overpass_urls {
+        match fetch_overpass_trails(client, url, bbox).await {
+            Ok(trails) => return Ok(trails),
+            Err(err) => {
+                tracing::warn!("overpass request failed for {}: {}", url, err);
+                last_error = Some(err);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| TrailError("no overpass endpoints configured".to_string())))
+}
+
 async fn fetch_overpass_trails(
     client: &reqwest::Client,
     overpass_url: &str,
     bbox: Bbox,
 ) -> Result<Vec<Trail>, TrailError> {
     let query = format!(
-        "[out:json][timeout:25];(way[highway=path][dog]({min_lat},{min_lon},{max_lat},{max_lon});way[highway=footway][dog]({min_lat},{min_lon},{max_lat},{max_lon});way[route=hiking][dog]({min_lat},{min_lon},{max_lat},{max_lon}););out tags geom;",
+        "[out:json][timeout:25];(way[highway=path][dog]({min_lat},{min_lon},{max_lat},{max_lon});way[highway=footway][dog]({min_lat},{min_lon},{max_lat},{max_lon});way[route=hiking][dog]({min_lat},{min_lon},{max_lat},{max_lon}););out tags center;",
         min_lat = bbox.min_lat,
         min_lon = bbox.min_lon,
         max_lat = bbox.max_lat,
         max_lon = bbox.max_lon
     );
 
+    if query.trim().is_empty() {
+        return Err(TrailError("overpass query is empty".to_string()));
+    }
+
+    let url = append_overpass_query(overpass_url, &query);
+
     let response = client
-        .post(overpass_url)
-        .form(&[("data", query)])
+        .get(url)
         .send()
         .await
         .map_err(|err| TrailError(format!("overpass request failed: {err}")))?;
 
     if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<no body>".to_string());
         return Err(TrailError(format!(
-            "overpass request failed with status {}",
-            response.status()
+            "overpass request failed with status {}: {}",
+            status, body
         )));
     }
 
@@ -274,6 +306,15 @@ async fn fetch_overpass_trails(
         .filter(|element| element.element_type == "way")
         .filter_map(|element| map_overpass_element(element))
         .collect())
+}
+
+fn append_overpass_query(base_url: &str, query: &str) -> String {
+    let encoded = urlencoding::encode(query);
+    if base_url.contains('?') {
+        format!("{}&data={}", base_url, encoded)
+    } else {
+        format!("{}?data={}", base_url, encoded)
+    }
 }
 
 fn map_overpass_element(element: OverpassElement) -> Option<Trail> {
@@ -405,6 +446,9 @@ fn derive_distance_range(query: &TrailQuery) -> (Option<f32>, Option<f32>, Optio
 }
 
 fn within_distance(distance_km: f32, range: &(Option<f32>, Option<f32>, Option<f32>)) -> bool {
+    if distance_km == 0.0 {
+        return true;
+    }
     let (min_km, max_km, _) = range;
     if let Some(min) = min_km {
         if distance_km < *min {

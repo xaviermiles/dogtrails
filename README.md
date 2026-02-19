@@ -1,6 +1,6 @@
 # Stravata Trails (Rust)
 
-A small Rust + Axum web app that recommends dog-friendly running trails. It pulls live data from the OpenStreetMap Overpass API (a public API) and keeps provider notes for DOC/AllTrails for future integration.
+A small Rust + Axum web app that recommends dog-friendly running trails. It pulls live data from the OpenStreetMap Overpass API (a public API) and renders the UI server-side (no JavaScript required).
 
 ## Quick start
 
@@ -9,6 +9,10 @@ cargo run
 ```
 
 Open `http://127.0.0.1:3000`.
+
+If Overpass is busy, you can set multiple endpoints:
+
+`OVERPASS_URL=https://overpass-api.de/api/interpreter,https://overpass.kumi.systems/api/interpreter,https://overpass.nchc.org.tw/api/interpreter`
 
 ## API
 
