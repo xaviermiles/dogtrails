@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Stravata Trails</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <div>
+          <p class="eyebrow">Stravata</p>
+          <h1>Trail recommendations for you + your dog</h1>
+          <p class="subhead">
+            Pick how you’re feeling, and we’ll suggest dog-friendly routes with clear
+            dog-access notes.
+          </p>
+        </div>
+        <div class="pill">Local sample data · Rust + Axum</div>
+      </header>
+
+      <main>
+        <section class="card form-card">
+          <h2>Plan your run</h2>
+          <form id="trail-form">
+            <div class="grid">
+              <label>
+                Effort
+                <select name="effort">
+                  <option value="easy">Easy</option>
+                  <option value="steady" selected>Steady</option>
+                  <option value="hard">Hard</option>
+                </select>
+              </label>
+              <label>
+                Length
+                <select name="length">
+                  <option value="short">Short (2-6 km)</option>
+                  <option value="medium" selected>Medium (6-12 km)</option>
+                  <option value="long">Long (12-24 km)</option>
+                </select>
+              </label>
+              <label>
+                Dog access
+                <select name="dog">
+                  <option value="allowed_only">Dogs allowed only</option>
+                  <option value="allowed_or_partial" selected>Allowed or partial (with notes)</option>
+                  <option value="any">Show all (include no-dog)</option>
+                </select>
+              </label>
+              <label>
+                Difficulty
+                <select name="difficulty">
+                  <option value="">Any</option>
+                  <option value="easy">Easy</option>
+                  <option value="moderate">Moderate</option>
+                  <option value="hard">Hard</option>
+                </select>
+              </label>
+              <label>
+                Min distance (km)
+                <input type="number" name="min_km" min="1" step="0.5" placeholder="Optional" />
+              </label>
+              <label>
+                Max distance (km)
+                <input type="number" name="max_km" min="1" step="0.5" placeholder="Optional" />
+              </label>
+            </div>
+            <button type="submit">Find trails</button>
+          </form>
+          <div class="integration">
+            <h3>Fitness integrations (coming soon)</h3>
+            <p>
+              Connect Strava or Garmin to calibrate recommendations to your training history.
+            </p>
+            <div class="integration-buttons">
+              <button type="button" class="ghost">Connect Strava</button>
+              <button type="button" class="ghost">Connect Garmin</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="results-header">
+            <h2>Suggested routes</h2>
+            <span id="result-count"></span>
+          </div>
+          <div id="results" class="results"></div>
+        </section>
+
+        <section class="card">
+          <h2>Provider notes</h2>
+          <ul id="providers" class="providers"></ul>
+          <p class="note">
+            We’re using local sample trails today. Add a verified data source once you pick a
+            mapping provider with an approved API.
+          </p>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
