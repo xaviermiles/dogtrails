@@ -73,13 +73,14 @@ async fn fetch_overpass_trails(
             .await
             .map_err(|err| TrailError(format!("overpass request failed: {err}")))?;
 
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        // Overpass often also returns 504 when "The server is too busy to handle the request".
+        if matches!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::GATEWAY_TIMEOUT) {
             if attempt >= max_retries {
                 return Err(TrailError("overpass rate limited after retries".to_string()));
             }
             let delay = Duration::from_secs(2u64.pow(attempt as u32));
             tracing::warn!(
-                "overpass 429, retrying in {:?} (attempt {}/{})",
+                "overpass too many requests, retrying in {:?} (attempt {}/{})",
                 delay,
                 attempt,
                 max_retries

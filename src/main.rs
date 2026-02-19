@@ -9,7 +9,7 @@ use axum::{
 use tower_http::services::ServeDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use stravata::{filter_trails, ProviderInfo, TrailQuery, TrailService};
+use dogtrails::{filter_trails, ProviderInfo, TrailQuery, TrailService};
 
 #[derive(Clone)]
 struct AppState {
@@ -45,7 +45,7 @@ async fn main() {
             ]
         });
 
-    let doc_api_key = std::env::var("DOC_API_KEY").ok();
+    let doc_api_key = std::env::var("DOC_API_KEY").unwrap();
     let service = TrailService::new(overpass_urls, doc_api_key)
         .expect("failed to create trail service");
     let state = AppState {
@@ -79,7 +79,7 @@ async fn main() {
 async fn get_trails(
     State(state): State<AppState>,
     Query(query): Query<TrailQuery>,
-) -> Result<Json<Vec<stravata::Trail>>, (StatusCode, String)> {
+) -> Result<Json<Vec<dogtrails::Trail>>, (StatusCode, String)> {
     let trails = state
         .service
         .fetch_trails(&query)

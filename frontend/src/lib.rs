@@ -336,7 +336,7 @@ fn app() -> Html {
         <div class="app">
             <header>
                 <div>
-                    <p class="eyebrow">{"Stravata"}</p>
+                    <p class="eyebrow">{"dogtrails"}</p>
                     <h1>{"For you + dog"}</h1>
                 </div>
             </header>

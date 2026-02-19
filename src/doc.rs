@@ -5,7 +5,9 @@ use crate::{Bbox, Difficulty, DogPolicy, Provider, Trail, TrailError};
 
 const DOC_TRACKS_URL: &str = "https://api.doc.govt.nz/v1/tracks?coordinates=wgs84";
 
-pub(crate) async fn fetch_doc_tracks_all(
+/// Fetch all tracks from the DOC list endpoint (no detail calls).
+/// Returns lightweight Trail objects built from summary data only.
+pub(crate) async fn fetch_doc_summaries(
     client: &reqwest::Client,
     api_key: &str,
 ) -> Result<Vec<Trail>, TrailError> {
@@ -36,59 +38,17 @@ pub(crate) async fn fetch_doc_tracks_all(
     let items = extract_doc_items(&payload);
     tracing::info!("DOC API returned {} tracks total", items.len());
 
-    let candidates: Vec<(String, Value)> = items
-        .into_iter()
-        .filter_map(|item| {
-            let track_id = extract_doc_id(&item)?;
-            Some((track_id, item))
-        })
+    let trails: Vec<Trail> = items
+        .iter()
+        .filter_map(|item| map_doc_summary(item))
         .collect();
 
-    tracing::info!("DOC: {} tracks with valid IDs", candidates.len());
-
-    // Fetch details in parallel with a concurrency limit
-    const MAX_CONCURRENT: usize = 5;
-    let mut trails = Vec::new();
-    for chunk in candidates.chunks(MAX_CONCURRENT) {
-        let mut set = tokio::task::JoinSet::new();
-        for (track_id, item) in chunk.iter().cloned() {
-            let client = client.clone();
-            let api_key = api_key.to_string();
-            set.spawn(async move {
-                let detail = fetch_doc_detail(&client, &api_key, &track_id).await;
-                (item, track_id, detail)
-            });
-        }
-        while let Some(result) = set.join_next().await {
-            if let Ok((item, track_id, detail_result)) = result {
-                match detail_result {
-                    Ok(detail) => {
-                        let line_bbox = extract_line_bbox(&item)
-                            .or_else(|| extract_line_bbox(&detail));
-                        let line = extract_line_coords(&item)
-                            .or_else(|| extract_line_coords(&detail))
-                            .unwrap_or_default();
-                        if let Some(mut trail) = map_doc_track_no_bbox(&item, &detail) {
-                            if let Some(lb) = line_bbox {
-                                trail.line_bbox = lb;
-                            }
-                            trail.line = line;
-                            trails.push(trail);
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!("DOC detail fetch failed for {}: {}", track_id, err);
-                    }
-                }
-            }
-        }
-    }
-
-    tracing::info!("DOC: {} trails after mapping", trails.len());
+    tracing::info!("DOC: {} trails after mapping summaries", trails.len());
     Ok(trails)
 }
 
-async fn fetch_doc_detail(
+/// Fetch the detail JSON for a single track.
+pub(crate) async fn fetch_doc_detail(
     client: &reqwest::Client,
     api_key: &str,
     track_id: &str,
@@ -135,42 +95,48 @@ fn extract_doc_id(item: &Value) -> Option<String> {
     item.get("assetId")?.as_str().map(|s| s.to_string())
 }
 
-fn map_doc_track_no_bbox(summary: &Value, detail: &Value) -> Option<Trail> {
-    let name = doc_string_any(detail, summary, &["name", "trackName", "title"])?;
+fn map_doc_summary(summary: &Value) -> Option<Trail> {
+    let name = doc_string(summary, &["name", "trackName", "title"])?;
 
-    let (dog_policy, dog_notes) = doc_dog_policy(detail, summary);
+    let (dog_policy, dog_notes) = doc_dog_policy_single(summary);
 
-    let location = doc_string_any(
-        detail,
+    let location = doc_string(
         summary,
         &["locationString", "locationArray", "location", "region", "district", "place", "area"],
     )
     .unwrap_or_else(|| "New Zealand".to_string());
 
-    let surface = doc_string_any(detail, summary, &["surface", "trackSurface", "terrain"])
+    let surface = doc_string(summary, &["surface", "trackSurface", "terrain"])
         .unwrap_or_else(|| "Unknown".to_string());
 
-    let distance_km = doc_distance_km(detail, summary).unwrap_or(0.0);
+    let distance_km = doc_distance_km_single(summary).unwrap_or(0.0);
 
-    let difficulty = doc_difficulty(detail, summary)
+    let difficulty = doc_difficulty_single(summary)
         .unwrap_or_else(|| crate::map_difficulty(None, distance_km));
 
-    let map_url = doc_string_any(detail, summary, &["staticLink", "url", "webUrl", "docUrl", "link"])
+    let map_url = doc_string(summary, &["staticLink", "url", "webUrl", "docUrl", "link"])
         .unwrap_or_else(|| "https://www.doc.govt.nz".to_string());
 
-    let id = extract_doc_id(detail)
-        .or_else(|| extract_doc_id(summary))
+    let id = extract_doc_id(summary)
         .unwrap_or_else(|| name.to_lowercase().replace(' ', "-"));
 
-    let (trail_lat, trail_lon) = doc_lat_lon(detail, summary).unwrap_or((0.0, 0.0));
+    let (trail_lat, trail_lon) = extract_lat_lon(summary).unwrap_or((0.0, 0.0));
+
+    let line = extract_line_coords(summary).unwrap_or_default();
+    let line_bbox = extract_line_bbox(summary).unwrap_or(Bbox {
+        min_lat: trail_lat,
+        min_lon: trail_lon,
+        max_lat: trail_lat,
+        max_lon: trail_lon,
+    });
 
     Some(Trail {
-        id: format!("doc-{}", id),
+        id,
         name,
         provider: Provider::DOC,
         location,
         distance_km,
-        elevation_m: None, // not in API
+        elevation_m: None,
         difficulty,
         dog_policy,
         dog_notes,
@@ -178,14 +144,58 @@ fn map_doc_track_no_bbox(summary: &Value, detail: &Value) -> Option<Trail> {
         map_url,
         lat: trail_lat,
         lon: trail_lon,
-        line: Vec::new(), // populated by caller
-        line_bbox: Bbox {
-            min_lat: trail_lat,
-            min_lon: trail_lon,
-            max_lat: trail_lat,
-            max_lon: trail_lon,
-        },
+        line,
+        line_bbox,
     })
+}
+
+/// Enrich a trail with fields from the detail endpoint, filling in
+/// any data the summary was missing.
+pub(crate) fn enrich_with_detail(trail: &mut Trail, detail: &Value) {
+    // Prefer detail values for fields that are often richer
+    if let Some(name) = doc_string(detail, &["name", "trackName", "title"]) {
+        trail.name = name;
+    }
+    if let Some(loc) = doc_string(
+        detail,
+        &["locationString", "locationArray", "location", "region", "district", "place", "area"],
+    ) {
+        trail.location = loc;
+    }
+    if let Some(km) = doc_distance_km_single(detail) {
+        if trail.distance_km == 0.0 || km > 0.0 {
+            trail.distance_km = km;
+        }
+    }
+    if let Some(diff) = doc_difficulty_single(detail) {
+        trail.difficulty = diff;
+    }
+    let (dog_policy, dog_notes) = doc_dog_policy_single(detail);
+    if dog_policy != DogPolicy::Unknown {
+        trail.dog_policy = dog_policy;
+        trail.dog_notes = dog_notes;
+    }
+    if let Some(surface) = doc_string(detail, &["surface", "trackSurface", "terrain"]) {
+        trail.surface = surface;
+    }
+    if let Some(url) = doc_string(detail, &["staticLink", "url", "webUrl", "docUrl", "link"]) {
+        trail.map_url = url;
+    }
+    // Fill in line coords from detail if summary had none
+    if trail.line.is_empty() {
+        if let Some(line) = extract_line_coords(detail) {
+            trail.line = line;
+        }
+    }
+    if let Some(lb) = extract_line_bbox(detail) {
+        trail.line_bbox = lb;
+    }
+    if let Some((lat, lon)) = extract_lat_lon(detail) {
+        if trail.lat == 0.0 && trail.lon == 0.0 {
+            trail.lat = lat;
+            trail.lon = lon;
+        }
+    }
 }
 
 fn doc_string(value: &Value, keys: &[&str]) -> Option<String> {
@@ -211,14 +221,6 @@ fn doc_string(value: &Value, keys: &[&str]) -> Option<String> {
         }
     }
     None
-}
-
-fn doc_string_any(primary: &Value, secondary: &Value, keys: &[&str]) -> Option<String> {
-    doc_string(primary, keys).or_else(|| doc_string(secondary, keys))
-}
-
-fn doc_number_any(primary: &Value, secondary: &Value, keys: &[&str]) -> Option<f64> {
-    doc_number(primary, keys).or_else(|| doc_number(secondary, keys))
 }
 
 fn doc_number(value: &Value, keys: &[&str]) -> Option<f64> {
@@ -253,9 +255,9 @@ fn parse_number(text: &str) -> Option<f64> {
     }
 }
 
-fn doc_distance_km(primary: &Value, secondary: &Value) -> Option<f32> {
-    let raw = doc_number_any(primary, secondary, &["distance", "distanceKm", "length", "trackLength"])?;
-    let text = doc_string_any(primary, secondary, &["distance", "distanceKm", "length", "trackLength"]);
+fn doc_distance_km_single(value: &Value) -> Option<f32> {
+    let raw = doc_number(value, &["distance", "distanceKm", "length", "trackLength"])?;
+    let text = doc_string(value, &["distance", "distanceKm", "length", "trackLength"]);
     if let Some(text) = text {
         let lower = text.to_lowercase();
         if lower.contains(" m") && !lower.contains("km") {
@@ -269,9 +271,9 @@ fn doc_distance_km(primary: &Value, secondary: &Value) -> Option<f32> {
     }
 }
 
-fn doc_difficulty(primary: &Value, secondary: &Value) -> Option<Difficulty> {
-    let value = doc_string_any(primary, secondary, &["difficulty", "grade", "trackGrade", "walkTrackCategory"])?;
-    let lower = value.to_lowercase();
+fn doc_difficulty_single(value: &Value) -> Option<Difficulty> {
+    let text = doc_string(value, &["difficulty", "grade", "trackGrade", "walkTrackCategory"])?;
+    let lower = text.to_lowercase();
     if lower.contains("easy") {
         Some(Difficulty::Easy)
     } else if lower.contains("moderate") || lower.contains("intermediate") {
@@ -283,9 +285,9 @@ fn doc_difficulty(primary: &Value, secondary: &Value) -> Option<Difficulty> {
     }
 }
 
-fn doc_dog_policy(primary: &Value, secondary: &Value) -> (DogPolicy, Option<String>) {
-    let allowed = doc_bool_any(primary, secondary, &["dogsAllowed", "dogAllowed"]);
-    let on_lead = doc_bool_any(primary, secondary, &["dogsAllowedOnLead", "dogsOnLead"]);
+fn doc_dog_policy_single(value: &Value) -> (DogPolicy, Option<String>) {
+    let allowed = doc_bool(value, &["dogsAllowed", "dogAllowed"]);
+    let on_lead = doc_bool(value, &["dogsAllowedOnLead", "dogsOnLead"]);
     if let Some(false) = allowed {
         return (DogPolicy::NotAllowed, Some("Dogs are not permitted.".to_string()));
     }
@@ -296,25 +298,24 @@ fn doc_dog_policy(primary: &Value, secondary: &Value) -> (DogPolicy, Option<Stri
         return (DogPolicy::Allowed, None);
     }
 
-    if let Some(text) = doc_string_any(primary, secondary, &["dogsAllowed", "dogAccess", "dogs", "dogRules"]) {
-        let lower = text.to_lowercase();
-        if lower.contains("no") && lower.contains("dog") {
-            return (DogPolicy::NotAllowed, Some(text));
+    if let Some(text) = doc_string(value, &["dogsAllowed"]) {
+        if text.contains("Dogs with a DOC permit for recreational hunting or management purposes only.") {
+            return (DogPolicy::HuntingPermit, Option::None);
         }
-        if lower.contains("lead") || lower.contains("leash") || lower.contains("controlled") {
-            return (DogPolicy::Partial, Some(text));
+        if text.contains("Dogs on a leash only. Other pets on conservation land rules.") {
+            // TODO: add DogPolicy::LeashOnly and remove Partial
+            return (DogPolicy::Partial, Option::None);
         }
-        return (DogPolicy::Allowed, Some(text));
+        if text.contains("No dogs. Other pets on conservation land rules.") {
+            return (DogPolicy::NotAllowed, Option::None);
+        }
+        return (DogPolicy::Unknown, Some(text));
     }
 
     (
-        DogPolicy::Partial,
-        Some("Check the DOC track page for dog access details.".to_string()),
+        DogPolicy::Unknown,
+        Some("???".to_string()),
     )
-}
-
-fn doc_bool_any(primary: &Value, secondary: &Value, keys: &[&str]) -> Option<bool> {
-    doc_bool(primary, keys).or_else(|| doc_bool(secondary, keys))
 }
 
 fn doc_bool(value: &Value, keys: &[&str]) -> Option<bool> {
@@ -335,10 +336,6 @@ fn doc_bool(value: &Value, keys: &[&str]) -> Option<bool> {
         }
     }
     None
-}
-
-fn doc_lat_lon(primary: &Value, secondary: &Value) -> Option<(f64, f64)> {
-    extract_lat_lon(primary).or_else(|| extract_lat_lon(secondary))
 }
 
 fn extract_lat_lon(value: &Value) -> Option<(f64, f64)> {
@@ -420,11 +417,13 @@ fn extract_line_bbox(value: &Value) -> Option<Bbox> {
 
 /// Filter DOC trails: include if the track's line bbox intersects the view.
 pub(crate) fn filter_doc_by_bbox(trails: &[Trail], view: Bbox) -> Vec<Trail> {
-    trails
+    let filtered_trails = trails
         .iter()
         .filter(|trail| bbox_intersects(view, trail.line_bbox))
         .cloned()
-        .collect()
+        .collect::<Vec<_>>();
+    tracing::info!("DOC filtered by bounding box gives {} tracks total", filtered_trails.len());
+    filtered_trails
 }
 
 /// Extract line coordinates as `[[lat, lon], ...]` from the DOC `line` field.

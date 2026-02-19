@@ -1,9 +1,11 @@
 mod doc;
 mod overpass;
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::RwLock;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -19,7 +21,9 @@ pub enum Difficulty {
 pub enum DogPolicy {
     Allowed,
     Partial,
+    HuntingPermit,
     NotAllowed,
+    Unknown,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,8 +174,10 @@ pub struct TrailService {
     overpass_urls: Vec<String>,
     overpass_cache: RwLock<Option<OverpassCacheEntry>>,
     overpass_semaphore: tokio::sync::Semaphore,
-    doc_cache: RwLock<Option<DocCacheEntry>>,
-    doc_api_key: Option<String>,
+    doc_summary_cache: RwLock<Option<DocSummaryCache>>,
+    doc_detail_cache: RwLock<HashMap<String, Value>>,
+    doc_semaphore: tokio::sync::Semaphore,
+    doc_api_key: String,
 }
 
 struct OverpassCacheEntry {
@@ -180,15 +186,16 @@ struct OverpassCacheEntry {
     trails: Vec<Trail>,
 }
 
-struct DocCacheEntry {
+/// Cached list of summary-only Trail objects from /v1/tracks.
+struct DocSummaryCache {
     fetched_at: Instant,
     trails: Vec<Trail>,
 }
 
 impl TrailService {
-    pub fn new(overpass_urls: Vec<String>, doc_api_key: Option<String>) -> Result<Self, TrailError> {
+    pub fn new(overpass_urls: Vec<String>, doc_api_key: String) -> Result<Self, TrailError> {
         let client = reqwest::Client::builder()
-            .user_agent("stravata/0.1 (https://example.local)")
+            .user_agent("dogtrails/0.1 (https://example.local)")
             .build()
             .map_err(|err| TrailError(format!("failed to build http client: {err}")))?;
         Ok(Self {
@@ -196,25 +203,18 @@ impl TrailService {
             overpass_urls,
             overpass_cache: RwLock::new(None),
             overpass_semaphore: tokio::sync::Semaphore::new(1),
-            doc_cache: RwLock::new(None),
+            doc_summary_cache: RwLock::new(None),
+            doc_detail_cache: RwLock::new(HashMap::new()),
+            doc_semaphore: tokio::sync::Semaphore::new(1),
             doc_api_key,
         })
     }
 
     pub async fn fetch_trails(&self, query: &TrailQuery) -> Result<Vec<Trail>, TrailError> {
         let bbox = Bbox::from_query(query).unwrap_or_default();
-        let overpass_trails = self.fetch_overpass_cached(bbox).await?;
-        let mut combined = overpass_trails;
-
-        if let Some(api_key) = self.doc_api_key.as_ref() {
-            match self.fetch_doc_cached(api_key, bbox).await {
-                Ok(mut doc_trails) => combined.append(&mut doc_trails),
-                Err(err) => {
-                    tracing::warn!("DOC fetch failed: {}", err);
-                }
-            }
-        }
-
+        let mut combined = self.fetch_overpass_cached(bbox).await?;
+        combined.extend(self.fetch_doc_cached(bbox).await?);
+        
         Ok(combined)
     }
 
@@ -261,24 +261,78 @@ impl TrailService {
         Ok(trails)
     }
 
-    async fn fetch_doc_cached(&self, api_key: &str, bbox: Bbox) -> Result<Vec<Trail>, TrailError> {
+    async fn fetch_doc_cached(&self, bbox: Bbox) -> Result<Vec<Trail>, TrailError> {
         let ttl = Duration::from_secs(60 * 60 * 12);
 
-        if let Some(cached) = self.doc_cache.read().await.as_ref() {
-            if cached.fetched_at.elapsed() < ttl {
-                return Ok(doc::filter_doc_by_bbox(&cached.trails, bbox));
+        // 1. Ensure the summary list is cached.
+        {
+            let needs_fetch = match self.doc_summary_cache.read().await.as_ref() {
+                Some(cached) => cached.fetched_at.elapsed() >= ttl,
+                None => true,
+            };
+            if needs_fetch {
+                // Only allow one in-flight DOC summary request at a time
+                let permit = match self.doc_semaphore.try_acquire() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        if let Some(cached) = self.doc_summary_cache.read().await.as_ref() {
+                            tracing::debug!("DOC summary request in-flight, serving cached data");
+                            let visible = doc::filter_doc_by_bbox(&cached.trails, bbox);
+                            return self.enrich_visible(&self.doc_api_key, visible).await;
+                        }
+                        self.doc_semaphore.acquire().await
+                            .map_err(|_| TrailError("semaphore closed".to_string()))?
+                    }
+                };
+
+                // Re-check after acquiring permit
+                let still_needs = match self.doc_summary_cache.read().await.as_ref() {
+                    Some(cached) => cached.fetched_at.elapsed() >= ttl,
+                    None => true,
+                };
+                if still_needs {
+                    let trails = doc::fetch_doc_summaries(&self.client, &self.doc_api_key).await?;
+                    *self.doc_summary_cache.write().await = Some(DocSummaryCache {
+                        fetched_at: Instant::now(),
+                        trails,
+                    });
+                }
+                drop(permit);
             }
         }
 
-        // Fetch all DOC trails (no bbox filter) and cache globally
-        let trails = doc::fetch_doc_tracks_all(&self.client, api_key).await?;
-        let mut cache = self.doc_cache.write().await;
-        *cache = Some(DocCacheEntry {
-            fetched_at: Instant::now(),
-            trails: trails.clone(),
-        });
+        // 2. Filter by bbox.
+        let visible = {
+            let guard = self.doc_summary_cache.read().await;
+            let cache = guard.as_ref().unwrap();
+            doc::filter_doc_by_bbox(&cache.trails, bbox)
+        };
 
-        Ok(doc::filter_doc_by_bbox(&trails, bbox))
+        // 3. Enrich visible trails with cached details.
+        self.enrich_visible(&self.doc_api_key, visible).await
+    }
+
+    /// Fetch and cache detail for each visible trail, enriching it in place.
+    async fn enrich_visible(&self, api_key: &str, mut trails: Vec<Trail>) -> Result<Vec<Trail>, TrailError> {
+        for trail in &mut trails {
+            // Check detail cache
+            if let Some(detail) = self.doc_detail_cache.read().await.get(&trail.id) {
+                doc::enrich_with_detail(trail, detail);
+                continue;
+            }
+
+            // Fetch detail and cache it
+            match doc::fetch_doc_detail(&self.client, api_key, &trail.id).await {
+                Ok(detail) => {
+                    doc::enrich_with_detail(trail, &detail);
+                    self.doc_detail_cache.write().await.insert(trail.id.clone(), detail);
+                }
+                Err(err) => {
+                    tracing::warn!("DOC detail fetch failed for {}: {}", trail.id, err);
+                }
+            }
+        }
+        Ok(trails)
     }
 }
 
@@ -330,9 +384,13 @@ pub(crate) fn map_difficulty(sac_scale: Option<&String>, distance_km: f32) -> Di
 
 fn dog_policy_allows(trail: &Trail, filter: &DogFilter) -> bool {
     match filter {
-        DogFilter::AllowedOnly => trail.dog_policy == DogPolicy::Allowed,
+        DogFilter::AllowedOnly => {
+            trail.dog_policy == DogPolicy::Allowed || trail.dog_policy == DogPolicy::Unknown
+        }
         DogFilter::AllowedOrPartial => {
-            trail.dog_policy == DogPolicy::Allowed || trail.dog_policy == DogPolicy::Partial
+            trail.dog_policy == DogPolicy::Allowed
+                || trail.dog_policy == DogPolicy::Partial
+                || trail.dog_policy == DogPolicy::Unknown
         }
         DogFilter::Any => true,
     }
