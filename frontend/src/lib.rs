@@ -80,7 +80,7 @@ impl Default for Filters {
             min_km: 0.0,
             max_km: 70.0,
             autorefresh: true,
-            bbox: default_bbox(),
+            bbox: Bbox::default(),
         }
     }
 }
@@ -116,14 +116,18 @@ struct Trail {
     dog_notes: Option<String>,
     surface: String,
     map_url: String,
+    lat: f64,
+    lon: f64,
 }
 
-fn default_bbox() -> Bbox {
-    Bbox {
-        min_lat: -43.60,
-        min_lon: 172.50,
-        max_lat: -43.45,
-        max_lon: 172.77,
+impl Default for Bbox {
+    fn default() -> Self {
+        Self {
+            min_lat: -43.60,
+            min_lon: 172.50,
+            max_lat: -43.45,
+            max_lon: 172.77,
+        }
     }
 }
 
@@ -137,20 +141,31 @@ fn app() -> Html {
     let filters = use_state(Filters::default);
     let results = use_state(ResultsState::default);
     let map_ref = use_node_ref();
+    let map_handle = use_mut_ref(|| None::<leaflet::MapHandle>);
+    let slider_min = use_state(|| 0.0f32);
+    let slider_max = use_state(|| 70.0f32);
+
+    // Keep a ref in sync with the latest filters so the map callback can read it
+    // without suffering from stale-closure captures.
+    let filters_ref = use_mut_ref(|| (*filters).clone());
+    *filters_ref.borrow_mut() = (*filters).clone();
 
     {
         let filters = filters.clone();
+        let filters_ref = filters_ref.clone();
         let map_ref = map_ref.clone();
+        let map_handle = map_handle.clone();
         use_effect_with(
             (),
             move |_| {
                 if let Some(element) = map_ref.cast::<web_sys::HtmlElement>() {
                     let bbox = (*filters).bbox;
-                    leaflet::init_map(element, bbox, move |bounds| {
-                        let mut next = (*filters).clone();
+                    let handle = leaflet::init_map(element, bbox, move |bounds| {
+                        let mut next = filters_ref.borrow().clone();
                         next.bbox = bounds;
                         filters.set(next);
                     });
+                    *map_handle.borrow_mut() = Some(handle);
                 }
                 || ()
             },
@@ -164,6 +179,20 @@ fn app() -> Html {
             move |current| {
                 if current.autorefresh {
                     fetch_trails(current.clone(), results.clone());
+                }
+                || ()
+            },
+        );
+    }
+
+    {
+        let map_handle = map_handle.clone();
+        let trails = (*results).trails.clone();
+        use_effect_with(
+            trails,
+            move |trails| {
+                if let Some(ref handle) = *map_handle.borrow() {
+                    leaflet::update_markers(handle, trails);
                 }
                 || ()
             },
@@ -203,17 +232,55 @@ fn app() -> Html {
         };
     });
 
-    let on_min = change_input(filters.clone(), |value, next| {
-        if let Ok(parsed) = value.parse::<f32>() {
-            next.min_km = parsed.min(next.max_km);
-        }
-    });
+    let on_min_input = {
+        let slider_min = slider_min.clone();
+        let slider_max = slider_max.clone();
+        Callback::from(move |event: InputEvent| {
+            let value = event
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+                .map(|i| i.value())
+                .unwrap_or_default();
+            if let Ok(parsed) = value.parse::<f32>() {
+                slider_min.set(parsed.min(*slider_max));
+            }
+        })
+    };
 
-    let on_max = change_input(filters.clone(), |value, next| {
-        if let Ok(parsed) = value.parse::<f32>() {
-            next.max_km = parsed.max(next.min_km);
-        }
-    });
+    let on_max_input = {
+        let slider_min = slider_min.clone();
+        let slider_max = slider_max.clone();
+        Callback::from(move |event: InputEvent| {
+            let value = event
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+                .map(|i| i.value())
+                .unwrap_or_default();
+            if let Ok(parsed) = value.parse::<f32>() {
+                slider_max.set(parsed.max(*slider_min));
+            }
+        })
+    };
+
+    let on_min_change = {
+        let filters = filters.clone();
+        let slider_min = slider_min.clone();
+        Callback::from(move |_event: Event| {
+            let mut next = (*filters).clone();
+            next.min_km = *slider_min;
+            filters.set(next);
+        })
+    };
+
+    let on_max_change = {
+        let filters = filters.clone();
+        let slider_max = slider_max.clone();
+        Callback::from(move |_event: Event| {
+            let mut next = (*filters).clone();
+            next.max_km = *slider_max;
+            filters.set(next);
+        })
+    };
 
     let on_autorefresh = {
         let filters = filters.clone();
@@ -229,8 +296,8 @@ fn app() -> Html {
     let loading = (*results).loading;
     let error = (*results).error.clone();
     let trails = (*results).trails.clone();
-    let min_percent = ((*filters).min_km / 70.0 * 100.0).clamp(0.0, 100.0);
-    let max_percent = ((*filters).max_km / 70.0 * 100.0).clamp(0.0, 100.0);
+    let min_percent = (*slider_min / 70.0 * 100.0).clamp(0.0, 100.0);
+    let max_percent = (*slider_max / 70.0 * 100.0).clamp(0.0, 100.0);
     let fill_style = format!(
         "left: {:.2}%; right: {:.2}%;",
         min_percent,
@@ -247,7 +314,6 @@ fn app() -> Html {
             </header>
             <main>
                 <section class="card form-card">
-                    <h2>{"Plan your run"}</h2>
                     <div class="grid">
                         <label>
                             {"Effort"}
@@ -285,15 +351,15 @@ fn app() -> Html {
                         <div class="range-field">
                             <span class="range-label">{"Distance (km)"}</span>
                             <div class="range-values">
-                                <span>{(*filters).min_km}</span>
+                                <span>{*slider_min}</span>
                                 <span>{"–"}</span>
-                                <span>{(*filters).max_km}</span>
+                                <span>{*slider_max}</span>
                             </div>
                             <div class="range-sliders">
                                 <div class="range-track"></div>
                                 <div class="range-fill" style={fill_style}></div>
-                                <input class="range-input range-input-min" type="range" min="0" max="70" step="1" value={(*filters).min_km.to_string()} oninput={on_min} />
-                                <input class="range-input range-input-max" type="range" min="0" max="70" step="1" value={(*filters).max_km.to_string()} oninput={on_max} />
+                                <input class="range-input range-input-min" type="range" min="0" max="70" step="1" value={slider_min.to_string()} oninput={on_min_input} onchange={on_min_change} />
+                                <input class="range-input range-input-max" type="range" min="0" max="70" step="1" value={slider_max.to_string()} oninput={on_max_input} onchange={on_max_change} />
                             </div>
                         </div>
                         <label class="checkbox">
@@ -303,26 +369,15 @@ fn app() -> Html {
                     </div>
                 </section>
 
-                <section class="card">
-                    <div class="results-header">
-                        <h2>{"Suggested routes"}</h2>
-                        <span>{format!("{} route{}", trails.len(), if trails.len() == 1 { "" } else { "s" })}</span>
-                    </div>
+                <section class="card map-card">
                     <div class="results-layout">
                         <div class="map-panel">
                             <div id="map" ref={map_ref}></div>
-                            <p class="note">{"Pan/zoom the map to change the bounding box."}</p>
                         </div>
                         <div class="results">
                             {render_results(loading, error, trails)}
                         </div>
                     </div>
-                </section>
-
-                <section class="card">
-                    <h2>{"Provider notes"}</h2>
-                    <ul class="providers">{render_providers()}</ul>
-                    <p class="note">{"We use live OpenStreetMap data today. DOC/AllTrails integration requires an approved API."}</p>
                 </section>
             </main>
         </div>
@@ -348,42 +403,33 @@ fn render_results(loading: bool, error: Option<String>, trails: Vec<Trail>) -> H
                 html! {}
             };
             let distance_label = if trail.distance_km == 0.0 {
-                "distance unknown".to_string()
+                "Unknown".to_string()
             } else {
                 format!("{:.1} km", trail.distance_km)
             };
             html! {
                 <article class="trail">
                     <h3>{trail.name.clone()}</h3>
-                    <div class="trail-meta">
-                        <span class="tag">{trail.location.clone()}</span>
-                        <span class="tag">{distance_label}</span>
-                        <span class="tag">{format!("{} m gain", trail.elevation_m)}</span>
-                        <span class="tag">{format_label(&format!("{:?}", trail.difficulty).to_lowercase())}</span>
-                        <span class="tag">{trail.provider.clone()}</span>
-                    </div>
-                    <div class="trail-meta">
-                        <span class="tag">{format!("Dog policy: {}", format_label(&trail.dog_policy))}</span>
-                        <span class="tag">{format!("Surface: {}", trail.surface)}</span>
-                    </div>
-                    <div>
-                        <a href={trail.map_url.clone()} target="_blank" rel="noreferrer">{"View map"}</a>
-                    </div>
+                    <dl class="trail-detail">
+                        <dt>{"Distance"}</dt>
+                        <dd>{distance_label}</dd>
+                        <dt>{"Elevation"}</dt>
+                        <dd>{format!("{} m", trail.elevation_m)}</dd>
+                        <dt>{"Difficulty"}</dt>
+                        <dd>{format_label(&format!("{:?}", trail.difficulty).to_lowercase())}</dd>
+                        <dt>{"Dogs"}</dt>
+                        <dd>{format_label(&trail.dog_policy)}</dd>
+                        <dt>{"Surface"}</dt>
+                        <dd>{trail.surface.clone()}</dd>
+                        <dt>{"Area"}</dt>
+                        <dd>{trail.location.clone()}</dd>
+                        <dt>{"Source"}</dt>
+                        <dd><a href={trail.map_url.clone()} target="_blank" rel="noreferrer">{trail.provider.clone()}</a></dd>
+                    </dl>
                     {warning}
                 </article>
             }
         })
-    }
-}
-
-fn render_providers() -> Html {
-    html! {
-        <li>
-            <strong>{"OpenStreetMap Overpass"}</strong><br />
-            <span>{"Public API"}</span><br />
-            <em>{"Uses public OSM data with dog access tags when present."}</em><br />
-            <a href="https://overpass-api.de" target="_blank" rel="noreferrer">{"https://overpass-api.de"}</a>
-        </li>
     }
 }
 
@@ -395,22 +441,6 @@ fn change_select(
         let value = event
             .target()
             .and_then(|target| target.dyn_into::<web_sys::HtmlSelectElement>().ok())
-            .map(|input| input.value())
-            .unwrap_or_default();
-        let mut next = (*state).clone();
-        update(value, &mut next);
-        state.set(next);
-    })
-}
-
-fn change_input(
-    state: UseStateHandle<Filters>,
-    update: impl Fn(String, &mut Filters) + 'static,
-) -> Callback<InputEvent> {
-    Callback::from(move |event: InputEvent| {
-        let value = event
-            .target()
-            .and_then(|target| target.dyn_into::<web_sys::HtmlInputElement>().ok())
             .map(|input| input.value())
             .unwrap_or_default();
         let mut next = (*state).clone();

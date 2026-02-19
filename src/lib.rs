@@ -20,11 +20,28 @@ pub enum DogPolicy {
     NotAllowed,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Provider {
+    DOC,
+    OpenStreetMap,
+    AllTrails,
+}
+
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Provider::DOC => write!(f, "DOC"),
+            Provider::OpenStreetMap => write!(f, "OpenStreetMap"),
+            Provider::AllTrails => write!(f, "AllTrails"),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Trail {
     pub id: String,
     pub name: String,
-    pub provider: String,
+    pub provider: Provider,
     pub location: String,
     pub distance_km: f32,
     pub elevation_m: u32,
@@ -33,6 +50,10 @@ pub struct Trail {
     pub dog_notes: Option<String>,
     pub surface: String,
     pub map_url: String,
+    pub lat: f64,
+    pub lon: f64,
+    #[serde(skip)]
+    pub line_bbox: Bbox,
 }
 
 #[derive(Clone, Deserialize)]
@@ -67,7 +88,6 @@ pub struct TrailQuery {
     pub dog: Option<DogFilter>,
     pub effort: Option<Effort>,
     pub length: Option<Length>,
-    pub max_results: Option<usize>,
     pub min_lat: Option<f64>,
     pub min_lon: Option<f64>,
     pub max_lat: Option<f64>,
@@ -107,12 +127,23 @@ impl ProviderInfo {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Bbox {
     pub min_lat: f64,
     pub min_lon: f64,
     pub max_lat: f64,
     pub max_lon: f64,
+}
+
+impl Default for Bbox {
+    fn default() -> Self {
+        Self {
+            min_lat: -43.60,
+            min_lon: 172.50,
+            max_lat: -43.45,
+            max_lon: 172.77,
+        }
+    }
 }
 
 impl Bbox {
@@ -141,6 +172,7 @@ pub struct TrailService {
     client: reqwest::Client,
     overpass_urls: Vec<String>,
     overpass_cache: RwLock<Option<OverpassCacheEntry>>,
+    overpass_semaphore: tokio::sync::Semaphore,
     doc_cache: RwLock<Option<DocCacheEntry>>,
     doc_api_key: Option<String>,
 }
@@ -166,13 +198,14 @@ impl TrailService {
             client,
             overpass_urls,
             overpass_cache: RwLock::new(None),
+            overpass_semaphore: tokio::sync::Semaphore::new(1),
             doc_cache: RwLock::new(None),
             doc_api_key,
         })
     }
 
     pub async fn fetch_trails(&self, query: &TrailQuery) -> Result<Vec<Trail>, TrailError> {
-        let bbox = Bbox::from_query(query).unwrap_or(default_bbox());
+        let bbox = Bbox::from_query(query).unwrap_or_default();
         let overpass_trails = self.fetch_overpass_cached(bbox).await?;
         let mut combined = overpass_trails;
 
@@ -197,6 +230,29 @@ impl TrailService {
             }
         }
 
+        // Only allow one in-flight Overpass request at a time
+        let permit = match self.overpass_semaphore.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // Another request is in-flight; serve stale cache if available
+                if let Some(cached) = self.overpass_cache.read().await.as_ref() {
+                    tracing::debug!("overpass request in-flight, serving cached data");
+                    return Ok(cached.trails.clone());
+                }
+                // No cache at all; wait for the permit
+                self.overpass_semaphore.acquire().await
+                    .map_err(|_| TrailError("semaphore closed".to_string()))?
+            }
+        };
+
+        // Re-check cache after acquiring permit (another request may have just finished)
+        if let Some(cached) = self.overpass_cache.read().await.as_ref() {
+            if cached.bbox == bbox && cached.fetched_at.elapsed() < ttl {
+                drop(permit);
+                return Ok(cached.trails.clone());
+            }
+        }
+
         let trails = fetch_overpass_with_fallback(&self.client, &self.overpass_urls, bbox).await?;
         let mut cache = self.overpass_cache.write().await;
         *cache = Some(OverpassCacheEntry {
@@ -204,6 +260,7 @@ impl TrailService {
             bbox,
             trails: trails.clone(),
         });
+        drop(permit);
         Ok(trails)
     }
 
@@ -212,23 +269,24 @@ impl TrailService {
 
         if let Some(cached) = self.doc_cache.read().await.as_ref() {
             if cached.fetched_at.elapsed() < ttl {
-                return Ok(cached.trails.clone());
+                return Ok(filter_doc_by_bbox(&cached.trails, bbox));
             }
         }
 
-        let trails = fetch_doc_tracks(&self.client, api_key, bbox).await?;
+        // Fetch all DOC trails (no bbox filter) and cache globally
+        let trails = fetch_doc_tracks_all(&self.client, api_key).await?;
         let mut cache = self.doc_cache.write().await;
         *cache = Some(DocCacheEntry {
             fetched_at: Instant::now(),
             trails: trails.clone(),
         });
-        Ok(trails)
+
+        Ok(filter_doc_by_bbox(&trails, bbox))
     }
 }
 
 pub fn filter_trails(trails: &[Trail], query: &TrailQuery) -> Vec<Trail> {
     let dog_filter = query.dog.clone().unwrap_or(DogFilter::AllowedOrPartial);
-    let max_results = query.max_results.unwrap_or(6);
     let range = derive_distance_range(query);
     let effort = query.effort.clone();
 
@@ -250,18 +308,8 @@ pub fn filter_trails(trails: &[Trail], query: &TrailQuery) -> Vec<Trail> {
     matches.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     matches
         .into_iter()
-        .take(max_results)
         .map(|(trail, _)| trail)
         .collect()
-}
-
-fn default_bbox() -> Bbox {
-    Bbox {
-        min_lat: -41.35,
-        min_lon: 174.72,
-        max_lat: -41.24,
-        max_lon: 174.82,
-    }
 }
 
 #[derive(Deserialize)]
@@ -276,6 +324,7 @@ struct OverpassElement {
     id: u64,
     tags: Option<std::collections::HashMap<String, String>>,
     geometry: Option<Vec<OverpassPoint>>,
+    center: Option<OverpassPoint>,
 }
 
 #[derive(Deserialize)]
@@ -302,12 +351,11 @@ async fn fetch_overpass_with_fallback(
     Err(last_error.unwrap_or_else(|| TrailError("no overpass endpoints configured".to_string())))
 }
 
-const DOC_TRACKS_URL: &str = "https://api.doc.govt.nz/v1/tracks";
+const DOC_TRACKS_URL: &str = "https://api.doc.govt.nz/v1/tracks?coordinates=wgs84";
 
-async fn fetch_doc_tracks(
+async fn fetch_doc_tracks_all(
     client: &reqwest::Client,
     api_key: &str,
-    bbox: Bbox,
 ) -> Result<Vec<Trail>, TrailError> {
     let response = client
         .get(DOC_TRACKS_URL)
@@ -334,26 +382,53 @@ async fn fetch_doc_tracks(
         .map_err(|err| TrailError(format!("DOC tracks response parse failed: {err}")))?;
 
     let items = extract_doc_items(&payload);
+    tracing::info!("DOC API returned {} tracks total", items.len());
+
+    let candidates: Vec<(String, Value)> = items
+        .into_iter()
+        .filter_map(|item| {
+            let track_id = extract_doc_id(&item)?;
+            Some((track_id, item))
+        })
+        .collect();
+
+    tracing::info!("DOC: {} tracks with valid IDs", candidates.len());
+
+    // Fetch details in parallel with a concurrency limit
+    const MAX_CONCURRENT: usize = 5;
     let mut trails = Vec::new();
-
-    for item in items {
-        let Some(track_id) = extract_doc_id(&item) else {
-            continue;
-        };
-
-        let detail = match fetch_doc_detail(client, api_key, &track_id).await {
-            Ok(detail) => detail,
-            Err(err) => {
-                tracing::warn!("DOC detail fetch failed for {}: {}", track_id, err);
-                continue;
+    for chunk in candidates.chunks(MAX_CONCURRENT) {
+        let mut set = tokio::task::JoinSet::new();
+        for (track_id, item) in chunk.iter().cloned() {
+            let client = client.clone();
+            let api_key = api_key.to_string();
+            set.spawn(async move {
+                let detail = fetch_doc_detail(&client, &api_key, &track_id).await;
+                (item, track_id, detail)
+            });
+        }
+        while let Some(result) = set.join_next().await {
+            if let Ok((item, track_id, detail_result)) = result {
+                match detail_result {
+                    Ok(detail) => {
+                        let line_bbox = extract_line_bbox(&item)
+                            .or_else(|| extract_line_bbox(&detail));
+                        if let Some(mut trail) = map_doc_track_no_bbox(&item, &detail) {
+                            if let Some(lb) = line_bbox {
+                                trail.line_bbox = lb;
+                            }
+                            trails.push(trail);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("DOC detail fetch failed for {}: {}", track_id, err);
+                    }
+                }
             }
-        };
-
-        if let Some(trail) = map_doc_track(&item, &detail, bbox) {
-            trails.push(trail);
         }
     }
 
+    tracing::info!("DOC: {} trails after mapping", trails.len());
     Ok(trails)
 }
 
@@ -362,7 +437,7 @@ async fn fetch_doc_detail(
     api_key: &str,
     track_id: &str,
 ) -> Result<Value, TrailError> {
-    let url = format!("https://api.doc.govt.nz/v1/tracks/{}/detail", track_id);
+    let url = format!("https://api.doc.govt.nz/v1/tracks/{}/detail?coordinates=wgs84", track_id);
     let response = client
         .get(url)
         .header("x-api-key", api_key)
@@ -401,10 +476,10 @@ fn extract_doc_items(payload: &Value) -> Vec<Value> {
 }
 
 fn extract_doc_id(item: &Value) -> Option<String> {
-    doc_string(item, &["id", "trackId", "track_id"])
+    item.get("assetId")?.as_str().map(|s| s.to_string())
 }
 
-fn map_doc_track(summary: &Value, detail: &Value, bbox: Bbox) -> Option<Trail> {
+fn map_doc_track_no_bbox(summary: &Value, detail: &Value) -> Option<Trail> {
     let name = doc_string_any(detail, summary, &["name", "trackName", "title"]) ?;
 
     let (dog_policy, dog_notes) = doc_dog_policy(detail, summary);
@@ -412,7 +487,7 @@ fn map_doc_track(summary: &Value, detail: &Value, bbox: Bbox) -> Option<Trail> {
     let location = doc_string_any(
         detail,
         summary,
-        &["location", "region", "district", "place", "area"],
+        &["locationString", "locationArray", "location", "region", "district", "place", "area"],
     )
     .unwrap_or_else(|| "New Zealand".to_string());
 
@@ -426,23 +501,19 @@ fn map_doc_track(summary: &Value, detail: &Value, bbox: Bbox) -> Option<Trail> {
 
     let difficulty = doc_difficulty(detail, summary).unwrap_or_else(|| map_difficulty(None, distance_km));
 
-    let map_url = doc_string_any(detail, summary, &["url", "webUrl", "docUrl", "link"])
+    let map_url = doc_string_any(detail, summary, &["staticLink", "url", "webUrl", "docUrl", "link"])
         .unwrap_or_else(|| "https://www.doc.govt.nz".to_string());
-
-    if let Some((lat, lon)) = doc_lat_lon(detail, summary) {
-        if !bbox_contains(bbox, lat, lon) {
-            return None;
-        }
-    }
 
     let id = extract_doc_id(detail)
         .or_else(|| extract_doc_id(summary))
         .unwrap_or_else(|| name.to_lowercase().replace(' ', "-"));
 
+    let (trail_lat, trail_lon) = doc_lat_lon(detail, summary).unwrap_or((0.0, 0.0));
+
     Some(Trail {
         id: format!("doc-{}", id),
         name,
-        provider: "DOC".to_string(),
+        provider: Provider::DOC,
         location,
         distance_km,
         elevation_m,
@@ -451,6 +522,9 @@ fn map_doc_track(summary: &Value, detail: &Value, bbox: Bbox) -> Option<Trail> {
         dog_notes,
         surface,
         map_url,
+        lat: trail_lat,
+        lon: trail_lon,
+        line_bbox: Bbox { min_lat: trail_lat, min_lon: trail_lon, max_lat: trail_lat, max_lon: trail_lon },
     })
 }
 
@@ -461,6 +535,17 @@ fn doc_string(value: &Value, keys: &[&str]) -> Option<String> {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
                     return Some(trimmed.to_string());
+                }
+            }
+            // Handle arrays of strings (e.g. DOC "region": ["Canterbury"])
+            if let Some(arr) = field.as_array() {
+                let parts: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !parts.is_empty() {
+                    return Some(parts.join(", "));
                 }
             }
         }
@@ -525,7 +610,7 @@ fn doc_distance_km(primary: &Value, secondary: &Value) -> Option<f32> {
 }
 
 fn doc_difficulty(primary: &Value, secondary: &Value) -> Option<Difficulty> {
-    let value = doc_string_any(primary, secondary, &["difficulty", "grade", "trackGrade"])?;
+    let value = doc_string_any(primary, secondary, &["difficulty", "grade", "trackGrade", "walkTrackCategory"])?;
     let lower = value.to_lowercase();
     if lower.contains("easy") {
         Some(Difficulty::Easy)
@@ -551,7 +636,7 @@ fn doc_dog_policy(primary: &Value, secondary: &Value) -> (DogPolicy, Option<Stri
         return (DogPolicy::Allowed, None);
     }
 
-    if let Some(text) = doc_string_any(primary, secondary, &["dogAccess", "dogs", "dogRules"]) {
+    if let Some(text) = doc_string_any(primary, secondary, &["dogsAllowed", "dogAccess", "dogs", "dogRules"]) {
         let lower = text.to_lowercase();
         if lower.contains("no") && lower.contains("dog") {
             return (DogPolicy::NotAllowed, Some(text));
@@ -597,9 +682,10 @@ fn doc_lat_lon(primary: &Value, secondary: &Value) -> Option<(f64, f64)> {
 }
 
 fn extract_lat_lon(value: &Value) -> Option<(f64, f64)> {
+    // Try explicit lat/lon keys
     if let (Some(lat), Some(lon)) = (
-        doc_number(value, &["latitude", "lat"]),
-        doc_number(value, &["longitude", "lon", "lng"]),
+        doc_number(value, &["latitude", "lat", "y"]),
+        doc_number(value, &["longitude", "lon", "lng", "x"]),
     ) {
         return Some((lat, lon));
     }
@@ -623,8 +709,55 @@ fn extract_lat_lon(value: &Value) -> Option<(f64, f64)> {
     None
 }
 
-fn bbox_contains(bbox: Bbox, lat: f64, lon: f64) -> bool {
-    lat >= bbox.min_lat && lat <= bbox.max_lat && lon >= bbox.min_lon && lon <= bbox.max_lon
+fn bbox_intersects(a: Bbox, b: Bbox) -> bool {
+    a.min_lat <= b.max_lat && a.max_lat >= b.min_lat
+        && a.min_lon <= b.max_lon && a.max_lon >= b.min_lon
+}
+
+/// Compute a bounding box from the DOC `line` field (array of [lon, lat] pairs).
+fn extract_line_bbox(value: &Value) -> Option<Bbox> {
+    let line = value.get("line")?.as_array()?;
+    let mut min_lat = f64::MAX;
+    let mut max_lat = f64::MIN;
+    let mut min_lon = f64::MAX;
+    let mut max_lon = f64::MIN;
+    let mut found = false;
+
+    for segment in line {
+        let points = match segment.as_array() {
+            Some(pts) => pts.as_slice(),
+            None => continue,
+        };
+        for point in points {
+            if let Some(pair) = point.as_array() {
+                // [lon, lat] GeoJSON order
+                if pair.len() >= 2 {
+                    if let (Some(lon), Some(lat)) = (pair[0].as_f64(), pair[1].as_f64()) {
+                        min_lat = min_lat.min(lat);
+                        max_lat = max_lat.max(lat);
+                        min_lon = min_lon.min(lon);
+                        max_lon = max_lon.max(lon);
+                        found = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if found {
+        Some(Bbox { min_lat, min_lon, max_lat, max_lon })
+    } else {
+        None
+    }
+}
+
+/// Filter DOC trails: include if the track's line bbox intersects the view.
+fn filter_doc_by_bbox(trails: &[Trail], view: Bbox) -> Vec<Trail> {
+    trails
+        .iter()
+        .filter(|trail| bbox_intersects(view, trail.line_bbox))
+        .cloned()
+        .collect()
 }
 
 async fn fetch_overpass_trails(
@@ -646,35 +779,50 @@ async fn fetch_overpass_trails(
 
     let url = append_overpass_query(overpass_url, &query);
 
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|err| TrailError(format!("overpass request failed: {err}")))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
+    let max_retries = 3;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let response = client
+            .get(&url)
+            .send()
             .await
-            .unwrap_or_else(|_| "<no body>".to_string());
-        return Err(TrailError(format!(
-            "overpass request failed with status {}: {}",
-            status, body
-        )));
+            .map_err(|err| TrailError(format!("overpass request failed: {err}")))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if attempt >= max_retries {
+                return Err(TrailError("overpass rate limited after retries".to_string()));
+            }
+            let delay = Duration::from_secs(2u64.pow(attempt as u32));
+            tracing::warn!("overpass 429, retrying in {:?} (attempt {}/{})", delay, attempt, max_retries);
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_string());
+            return Err(TrailError(format!(
+                "overpass request failed with status {}: {}",
+                status, body
+            )));
+        }
+
+        let data: OverpassResponse = response
+            .json()
+            .await
+            .map_err(|err| TrailError(format!("overpass response parse failed: {err}")))?;
+
+        return Ok(data
+            .elements
+            .into_iter()
+            .filter(|element| element.element_type == "way")
+            .filter_map(|element| map_overpass_element(element))
+            .collect());
     }
-
-    let data: OverpassResponse = response
-        .json()
-        .await
-        .map_err(|err| TrailError(format!("overpass response parse failed: {err}")))?;
-
-    Ok(data
-        .elements
-        .into_iter()
-        .filter(|element| element.element_type == "way")
-        .filter_map(|element| map_overpass_element(element))
-        .collect())
 }
 
 fn append_overpass_query(base_url: &str, query: &str) -> String {
@@ -713,13 +861,25 @@ fn map_overpass_element(element: OverpassElement) -> Option<Trail> {
         .get("addr:city")
         .cloned()
         .unwrap_or_else(|| "Unknown".to_string());
-    let provider = "OpenStreetMap".to_string();
     let map_url = format!("https://www.openstreetmap.org/way/{}", element.id);
+
+    let lat = element.center.as_ref().map(|c| c.lat)
+        .or_else(|| element.geometry.as_ref().and_then(|pts| {
+            if pts.is_empty() { None } else {
+                Some(pts.iter().map(|p| p.lat).sum::<f64>() / pts.len() as f64)
+            }
+        })).unwrap_or(0.0);
+    let lon = element.center.as_ref().map(|c| c.lon)
+        .or_else(|| element.geometry.as_ref().and_then(|pts| {
+            if pts.is_empty() { None } else {
+                Some(pts.iter().map(|p| p.lon).sum::<f64>() / pts.len() as f64)
+            }
+        })).unwrap_or(0.0);
 
     Some(Trail {
         id: format!("osm-{}", element.id),
         name,
-        provider,
+        provider: Provider::OpenStreetMap,
         location,
         distance_km,
         elevation_m: tags
@@ -732,6 +892,9 @@ fn map_overpass_element(element: OverpassElement) -> Option<Trail> {
         dog_notes,
         surface,
         map_url,
+        lat,
+        lon,
+        line_bbox: Bbox { min_lat: lat, min_lon: lon, max_lat: lat, max_lon: lon },
     })
 }
 
@@ -870,7 +1033,7 @@ mod tests {
             Trail {
                 id: "t1".to_string(),
                 name: "River Loop".to_string(),
-                provider: "DOC".to_string(),
+                provider: Provider::DOC,
                 location: "Wellington".to_string(),
                 distance_km: 5.0,
                 elevation_m: 120,
@@ -879,11 +1042,14 @@ mod tests {
                 dog_notes: None,
                 surface: "Gravel".to_string(),
                 map_url: "https://www.doc.govt.nz".to_string(),
+                lat: -41.3,
+                lon: 174.7,
+                line_bbox: Bbox { min_lat: -41.3, min_lon: 174.7, max_lat: -41.3, max_lon: 174.7 },
             },
             Trail {
                 id: "t2".to_string(),
                 name: "Forest Ridge".to_string(),
-                provider: "AllTrails".to_string(),
+                provider: Provider::AllTrails,
                 location: "Auckland".to_string(),
                 distance_km: 12.0,
                 elevation_m: 520,
@@ -892,6 +1058,9 @@ mod tests {
                 dog_notes: Some("Dog-free section after 2km".to_string()),
                 surface: "Dirt".to_string(),
                 map_url: "https://www.alltrails.com".to_string(),
+                lat: -36.8,
+                lon: 174.7,
+                line_bbox: Bbox { min_lat: -36.8, min_lon: 174.7, max_lat: -36.8, max_lon: 174.7 },
             },
         ]
     }

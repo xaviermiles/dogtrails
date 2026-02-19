@@ -9,81 +9,102 @@
   box-sizing: border-box;
 }
 
-body {
+html, body {
   margin: 0;
+  height: 100%;
+  overflow: hidden;
 }
 
 .app {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 32px 24px 56px;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  max-width: 100%;
+  padding: 12px 16px;
+  gap: 10px;
+  overflow: hidden;
 }
 
 header {
   display: flex;
   flex-wrap: wrap;
-  gap: 24px;
+  gap: 12px;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 32px;
+  flex-shrink: 0;
 }
 
 .eyebrow {
   text-transform: uppercase;
-  font-size: 12px;
+  font-size: 11px;
   letter-spacing: 0.2em;
   color: #5c6aa3;
-  margin: 0 0 8px;
+  margin: 0;
 }
 
 h1 {
-  margin: 0 0 12px;
-  font-size: 32px;
+  margin: 0;
+  font-size: 20px;
 }
 
 .subhead {
   margin: 0;
-  font-size: 16px;
+  font-size: 14px;
   color: #4a5166;
   max-width: 520px;
 }
 
 main {
-  display: grid;
-  gap: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .card {
   background: #fff;
-  border-radius: 16px;
-  padding: 24px;
-  box-shadow: 0 10px 30px rgba(16, 24, 40, 0.08);
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 4px 16px rgba(16, 24, 40, 0.06);
+  flex-shrink: 0;
+}
+
+.card.map-card {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .form-card h2 {
-  margin-top: 0;
+  margin: 0 0 8px;
+  font-size: 14px;
 }
 
 .grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: end;
 }
 
 label {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  font-size: 14px;
+  gap: 4px;
+  font-size: 13px;
   color: #4a5166;
 }
 
 select,
 input {
-  padding: 10px 12px;
-  border-radius: 10px;
+  padding: 6px 10px;
+  border-radius: 8px;
   border: 1px solid #d5dbea;
-  font-size: 14px;
+  font-size: 13px;
 }
 
 button {
@@ -118,67 +139,89 @@ button.ghost {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 16px;
+  margin-bottom: 8px;
+  flex-shrink: 0;
 }
 
 .results {
-  display: grid;
-  gap: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 .results-layout {
   display: grid;
-  grid-template-columns: minmax(320px, 1fr) minmax(320px, 1fr);
-  gap: 20px;
-  align-items: start;
+  grid-template-columns: 1fr minmax(280px, 360px);
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
 }
 
 .map-panel {
-  display: grid;
-  gap: 8px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
 #map {
   width: 100%;
-  height: 420px;
-  border-radius: 12px;
+  flex: 1;
+  min-height: 200px;
+  border-radius: 10px;
   border: 1px solid #eef1f8;
   overflow: hidden;
 }
 
 .range-field {
-  display: grid;
+  display: flex;
+  align-items: center;
   gap: 8px;
-  padding: 10px 12px;
-  border-radius: 12px;
+  padding: 6px 10px;
+  border-radius: 8px;
   border: 1px solid #d5dbea;
   background: #f9faff;
+  min-width: 200px;
 }
 
 .range-label {
   font-size: 13px;
   color: #4a5166;
+  white-space: nowrap;
 }
 
 .range-values {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 2px;
   font-weight: 600;
+  font-size: 13px;
   color: #2b3f94;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.range-values span:first-child,
+.range-values span:last-child {
+  display: inline-block;
+  min-width: 2ch;
+  text-align: right;
 }
 
 .range-sliders {
   position: relative;
-  height: 28px;
-  display: grid;
+  height: 20px;
+  flex: 1;
+  min-width: 80px;
+  display: flex;
   align-items: center;
 }
 
 .range-track {
   position: absolute;
   inset: 50% 0 auto 0;
-  height: 6px;
+  height: 4px;
   border-radius: 999px;
   background: #dfe5f3;
   transform: translateY(-50%);
@@ -187,7 +230,7 @@ button.ghost {
 .range-fill {
   position: absolute;
   inset: 50% 0 auto 0;
-  height: 6px;
+  height: 4px;
   border-radius: 999px;
   background: #2b3f94;
   transform: translateY(-50%);
@@ -196,8 +239,9 @@ button.ghost {
 .range-input {
   position: absolute;
   width: 100%;
-  height: 28px;
+  height: 20px;
   margin: 0;
+  padding: 0;
   background: none;
   pointer-events: none;
   -webkit-appearance: none;
@@ -206,23 +250,23 @@ button.ghost {
 
 .range-input::-webkit-slider-thumb {
   pointer-events: auto;
-  width: 18px;
-  height: 18px;
+  width: 14px;
+  height: 14px;
   border-radius: 50%;
   background: #ffffff;
   border: 2px solid #2b3f94;
-  box-shadow: 0 2px 4px rgba(16, 24, 40, 0.15);
+  box-shadow: 0 1px 3px rgba(16, 24, 40, 0.15);
   -webkit-appearance: none;
 }
 
 .range-input::-moz-range-thumb {
   pointer-events: auto;
-  width: 18px;
-  height: 18px;
+  width: 14px;
+  height: 14px;
   border-radius: 50%;
   background: #ffffff;
   border: 2px solid #2b3f94;
-  box-shadow: 0 2px 4px rgba(16, 24, 40, 0.15);
+  box-shadow: 0 1px 3px rgba(16, 24, 40, 0.15);
 }
 
 label.checkbox {
@@ -235,26 +279,42 @@ label.checkbox {
 
 .trail {
   border: 1px solid #eef1f8;
-  border-radius: 12px;
-  padding: 16px;
+  border-radius: 8px;
+  padding: 10px 12px;
 }
 
 .trail h3 {
-  margin: 0 0 8px;
+  margin: 0 0 4px;
+  font-size: 14px;
+  line-height: 1.3;
 }
 
-.trail-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  font-size: 13px;
+.trail-detail {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1px 10px;
+  font-size: 12px;
   color: #4a5166;
+  line-height: 1.5;
 }
 
-.tag {
-  background: #f3f5ff;
-  padding: 4px 10px;
-  border-radius: 999px;
+.trail-detail dt {
+  color: #8891ad;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.trail-detail dd {
+  margin: 0;
+}
+
+.trail-detail a {
+  color: #2b3f94;
+  text-decoration: none;
+}
+
+.trail-detail a:hover {
+  text-decoration: underline;
 }
 
 .warning {
@@ -290,9 +350,10 @@ label.checkbox {
 @media (max-width: 900px) {
   .results-layout {
     grid-template-columns: 1fr;
+    grid-template-rows: 1fr auto;
   }
 
-  #map {
-    height: 320px;
+  .results {
+    max-height: 200px;
   }
 }
